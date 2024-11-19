@@ -28,6 +28,8 @@ if 'call_active' not in st.session_state:
     st.session_state.all_transcripts = fetch_all_transcripts()
     st.session_state.recording_info = None
     st.session_state.call_selector = "Current Call"
+    st.session_state.status_check_needed = False  # Flag for status check
+    st.session_state.last_checked_status = None  # To track last status
 
 with st.sidebar:
     st.markdown("<h2 style='text-align: center; font-size: 2.5em;'>📞 AI Dialer</h2>", unsafe_allow_html=True)
@@ -54,18 +56,8 @@ with st.sidebar:
                     st.session_state.call_sid = call_sid
                     st.session_state.transcript = []
                     st.success(f"Call initiated. SID: {call_sid}")
-                    for _ in range(60):
-                        time.sleep(1)
-                        status = requests.get(f"https://{os.getenv('SERVER')}/call_status/{call_sid}").json().get('status')
-                        if status == 'in-progress':
-                            st.session_state.call_active = True
-                            st.session_state.call_selector = "Current Call"
-                            break
-                        if status in ['completed', 'failed', 'busy', 'no-answer']:
-                            st.error(f"Call ended: {status}")
-                            break
-                    else:
-                        st.error("Timeout waiting for call to connect.")
+                    st.session_state.call_active = True
+                    st.session_state.last_checked_status = 'in-progress'
                 else:
                     st.error(f"Failed to initiate call: {call_data}")
             except requests.RequestException as e:
@@ -132,7 +124,6 @@ if st.button("Refresh Call List"):
         on_call_selector_change()  # Refresh the recording URL after updating the call list
     except requests.RequestException as e:
         st.error(f"Error fetching call list: {str(e)}")
-    # Keep the existing system and initial messages (don't reset to env values)
 
 st.divider()
 
@@ -165,19 +156,26 @@ with st.spinner("Loading recording and transcript..."):
 if st.session_state.call_active:
     def update_call_info():
         try:
-            status = requests.get(f"https://{os.getenv('SERVER')}/call_status/{st.session_state.call_sid}").json().get('status')
-            if status not in ['in-progress', 'ringing']:
-                st.session_state.call_active = False
-                st.warning(f"Call ended: {status}")
-                return False
-            
-            transcript_data = requests.get(f"https://{os.getenv('SERVER')}/transcript/{st.session_state.call_sid}").json()
-            if transcript_data.get('call_ended', False):
-                st.session_state.call_active = False
-                st.info(f"Call ended. Status: {transcript_data.get('final_status', 'Unknown')}")
-                return False
-            
-            st.session_state.transcript = transcript_data.get('transcript', [])
+            # Only check call status if necessary (based on changes or need)
+            if st.session_state.last_checked_status != 'in-progress':
+                status = requests.get(f"https://{os.getenv('SERVER')}/call_status/{st.session_state.call_sid}").json().get('status')
+                
+                if status != st.session_state.last_checked_status:
+                    st.session_state.last_checked_status = status  # Update status
+                    if status not in ['in-progress', 'ringing']:
+                        st.session_state.call_active = False
+                        st.warning(f"Call ended: {status}")
+                        return False
+                    
+                    # If call is still in progress, set flag for next check
+                    transcript_data = requests.get(f"https://{os.getenv('SERVER')}/transcript/{st.session_state.call_sid}").json()
+                    if transcript_data.get('call_ended', False):
+                        st.session_state.call_active = False
+                        st.info(f"Call ended. Status: {transcript_data.get('final_status', 'Unknown')}")
+                        return False
+
+                    st.session_state.transcript = transcript_data.get('transcript', [])
+                    return True
             return True
         except requests.RequestException as e:
             st.sidebar.error(f"Error updating call info: {str(e)}")

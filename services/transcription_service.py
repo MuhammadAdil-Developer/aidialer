@@ -103,3 +103,6 @@ class TranscriptionService(EventEmitter):
             self.deepgram_live = None
         self.is_connected = False
         logger.info("Disconnected from Deepgram")
+
+        
+

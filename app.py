@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import django
 from collections import deque
 from typing import Dict
 
@@ -10,6 +11,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from twilio.rest import Client
 from twilio.twiml.voice_response import Connect, VoiceResponse
+from django.core.exceptions import ObjectDoesNotExist
+from asgiref.sync import sync_to_async
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'VoiceFusion.settings')
+django.setup()
 
 from logger_config import get_logger
 from services.call_context import CallContext
@@ -17,6 +23,8 @@ from services.llm_service import LLMFactory
 from services.stream_service import StreamService
 from services.transcription_service import TranscriptionService
 from services.tts_service import TTSFactory
+from Api.models import (AgentResponse,PromptRecord,TwilioInfo)
+
 
 dotenv.load_dotenv()
 app = FastAPI()
@@ -51,12 +59,14 @@ async def get_call_recording(call_sid: str):
 @app.websocket("/connection")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    
+    call_context = CallContext()
 
     llm_service_name = os.getenv("LLM_SERVICE", "openai")
     tts_service_name = os.getenv("TTS_SERVICE", "deepgram")
 
-    logger.info(f"Using LLM service: {llm_service_name}")
-    logger.info(f"Using TTS service: {tts_service_name}")
+    # logger.info(f"Using LLM service: {llm_service_name}")
+    # logger.info(f"Using TTS service: {tts_service_name}")
 
     llm_service = LLMFactory.get_llm_service(llm_service_name, CallContext())
     stream_service = StreamService(websocket)
@@ -65,6 +75,8 @@ async def websocket_endpoint(websocket: WebSocket):
     
     marks = deque()
     interaction_count = 0
+    
+   
 
     await transcription_service.connect()
 
@@ -105,7 +117,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
         except Exception as e:
             logger.error(f"Error while handling utterance: {e}")
-            e.print_stack()
 
     transcription_service.on('utterance', handle_utterance)
     transcription_service.on('transcription', handle_transcription)
@@ -131,12 +142,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 stream_sid = msg['start']['streamSid']
                 call_sid = msg['start']['callSid']
 
-                call_context = CallContext()
 
                 if os.getenv("RECORD_CALLS") == "true":
                     get_twilio_client().calls(call_sid).recordings.create({"recordingChannels": "dual"})
 
-                # Decide if the call the call was initiated from the UI or is an inbound
+                # Decide if the call was initiated from the UI or is inbound
                 if call_sid not in call_contexts:
                     # Inbound call
                     call_context.system_message = os.environ.get("SYSTEM_MESSAGE")
@@ -152,21 +162,28 @@ async def websocket_endpoint(websocket: WebSocket):
                 stream_service.set_stream_sid(stream_sid)
                 transcription_service.set_stream_sid(stream_sid)
 
-                logger.info(f"Twilio -> Starting Media Stream for {stream_sid}")
+                # logger.info(f"Twilio -> Starting Media Stream for {stream_sid}")
+    
+                # You can remove the initial message generation part here since it's handled in start_call
                 await tts_service.generate({
                     "partialResponseIndex": None,
                     "partialResponse": call_context.initial_message
                 }, 1)
+
             elif msg['event'] == 'media':
                 asyncio.create_task(process_media(msg))
+
             elif msg['event'] == 'mark':
                 label = msg['mark']['name']
                 if label in marks:
                     marks.remove(label)
+
             elif msg['event'] == 'stop':
                 logger.info(f"Twilio -> Media stream {stream_sid} ended.")
                 break
+
             message_queue.task_done()
+
 
     try:
         listener_task = asyncio.create_task(websocket_listener())
@@ -178,45 +195,74 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         await transcription_service.disconnect()
 
+
 def get_twilio_client():
     return Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
 
 # API route to initiate a call via UI
 @app.post("/start_call")
 async def start_call(request: Dict[str, str]):
-    """Initiate a call using Twilio with optional system and initial messages."""
-    to_number = request.get("to_number")
-    system_message = request.get("system_message")
-    initial_message = request.get("initial_message")
-    logger.info(f"Initiating call to {to_number}")
-
-    service_url = f"https://{os.getenv('SERVER')}/incoming"
-
-    if not to_number:
-        return {"error": "Missing 'to_number' in request"}
-
+    """Initiate a call using Twilio with database-driven prompt and messages."""
     try:
-        client = get_twilio_client()
+        to_number = request.get("to_number")
+        assistant_id = request.get("assistant_id")
+        twilio_info_id = request.get("twilio_info_id")
+
+        logger.info(f"Initiating call to {to_number} using assistant_id {assistant_id}")
+
+        # Service URL for webhook
+        service_url = f"https://{os.getenv('SERVER')}/incoming"
+
+        if not to_number:
+            return {"error": "Missing 'to_number' in request"}
+
+        # Fetch the prompt based on the assistant_id
+        try:
+            prompt_record = await sync_to_async(PromptRecord.objects.get)(id=assistant_id)
+            system_message = prompt_record.generated_prompt
+            initial_message = prompt_record.welcome_message
+        except ObjectDoesNotExist:
+            system_message = "Assistant Id Not Found..."
+            initial_message = "Welcome to the assistant. How can I help you today?"
+
+        logger.info(f"System Message: {system_message}, Initial Message: {initial_message}")
+
+        # Fetch Twilio credentials
+        try:
+            twilio_info = await sync_to_async(TwilioInfo.objects.get)(id=twilio_info_id)
+            ACCOUNT_SID = twilio_info.twilio_sid
+            AUTH_TOKEN = twilio_info.twilio_token
+            TWILIO_NUM = twilio_info.twilio_number
+        except ObjectDoesNotExist:
+            logger.error("Twilio Credentials Id Not Found.")
+            return {"error": "Twilio credentials not found"}
+
+        # Create a call
+        client = Client(ACCOUNT_SID, AUTH_TOKEN)
         logger.info(f"Initiating call to {to_number} via {service_url}")
         call = client.calls.create(
             to=to_number,
-            from_=os.getenv("APP_NUMBER"),
+            from_=TWILIO_NUM,
             url=f"{service_url}"
         )
         call_sid = call.sid
+
+        # Manage call context
         call_context = CallContext()
         call_contexts[call_sid] = call_context
-        
+        tts_service_name = os.getenv("TTS_SERVICE", "deepgram")
+        tts_service = TTSFactory.get_tts_service(tts_service_name)
 
-        # Set custom system and initial messages for this call if provided
-        call_context.system_message = system_message or os.getenv("SYSTEM_MESSAGE")
-        call_context.initial_message = initial_message or os.getenv("Config.INITIAL_MESSAGE")
+        # Set custom system and initial messages for this call
+        call_context.system_message = system_message
+        call_context.initial_message = initial_message
         call_context.call_sid = call_sid
 
         return {"call_sid": call_sid}
     except Exception as e:
         logger.error(f"Error initiating call: {str(e)}")
         return {"error": f"Failed to initiate call: {str(e)}"}
+
 
 # API route to get the status of a call
 @app.get("/call_status/{call_sid}")
@@ -278,4 +324,7 @@ if __name__ == "__main__":
     logger.info(f"Backend server address set to: {os.getenv('SERVER')}")
     port = int(os.getenv("PORT", 3000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+
 
